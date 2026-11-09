@@ -12,7 +12,7 @@ variables:
   PYTHON_RUNTIME: "python312"
 
 # ---------------------------------------------------------
-# Stage 1:  static checks (no GCP access needed)
+# Stage 1: cheap static checks (no GCP access needed)
 # ---------------------------------------------------------
 validate:
   stage: validate
@@ -29,14 +29,31 @@ validate:
 .deploy_template:
   stage: sync_schedulers
   image: google/cloud-sdk:slim
-  # tags: [ "<idfy-gcp-runner-tag>" ]   # uncomment if the GCP runner needs a tag
+  # GCP auth (same pattern as idfy/code/infra/cloud-functions/alertmanager-daily-summary):
+  #   GOOGLE_AUTH = CI/CD variable holding a deployer SA key (raw JSON or base64, masked).
+  #   If it is not set, the job falls back to the runner's own GCP identity.
   before_script:
     - apt-get update -qq && apt-get install -y -qq jq >/dev/null
+    - |
+      if [ -n "${GOOGLE_AUTH:-}" ]; then
+        umask 077
+        if printf '%s' "$GOOGLE_AUTH" | grep -q '^[[:space:]]*{'; then
+          printf '%s' "$GOOGLE_AUTH" > "$CI_PROJECT_DIR/gcloud-key.json"
+        else
+          printf '%s' "$GOOGLE_AUTH" | base64 -d > "$CI_PROJECT_DIR/gcloud-key.json"
+        fi
+        gcloud auth activate-service-account --key-file "$CI_PROJECT_DIR/gcloud-key.json"
+        rm -f "$CI_PROJECT_DIR/gcloud-key.json"
+      else
+        echo "GOOGLE_AUTH not set - using the runner's own GCP identity"
+      fi
     - echo "CI identity -> $(gcloud config get-value account 2>/dev/null)"
     - echo "Target project -> ${GCP_PROJECT_ID}"
   script:
     - chmod +x ./deploy.sh
     - ./deploy.sh
+  after_script:
+    - rm -f "$CI_PROJECT_DIR/gcloud-key.json"
 
 # ---------------------------------------------------------
 # TEST: any non-default branch, IDfy test project, manual click
@@ -47,16 +64,16 @@ deploy_test:
     name: test
   resource_group: schedulers-test
   variables:
-    GCP_PROJECT_ID: "<IDFY_TEST_PROJECT_ID>"
-    FUNCTION_SA_EMAIL: "scheduler-resumer-fn-sa@<IDFY_TEST_PROJECT_ID>.iam.gserviceaccount.com"
-    SCHEDULER_SA_EMAIL: "scheduler-resumer-invoker-sa@<IDFY_TEST_PROJECT_ID>.iam.gserviceaccount.com"
+    GCP_PROJECT_ID: "idfy-platform-dev"
+    FUNCTION_SA_EMAIL: "scheduler-resumer-fn-sa@idfy-platform-dev.iam.gserviceaccount.com"
+    SCHEDULER_SA_EMAIL: "scheduler-resumer-invoker-sa@idfy-platform-dev.iam.gserviceaccount.com"
     # BUILD_SA_EMAIL: ""   # optional; leave unset to use GCP's default Cloud Build SA
   rules:
     - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
       when: manual
 
 # ---------------------------------------------------------
-# PROD: default branch only, automatic on relevant changes
+# PROD: default branch only, manual click (same as feature branches)
 # ---------------------------------------------------------
 deploy_prod:
   extends: .deploy_template
@@ -64,15 +81,10 @@ deploy_prod:
     name: production
   resource_group: schedulers-production
   variables:
-    GCP_PROJECT_ID: "project-23b4d130-a5d8-4d92-806"
-    FUNCTION_SA_EMAIL: "scheduler-resumer-fn-sa@project-23b4d130-a5d8-4d92-806.iam.gserviceaccount.com"
-    SCHEDULER_SA_EMAIL: "scheduler-resumer-invoker-sa@project-23b4d130-a5d8-4d92-806.iam.gserviceaccount.com"
+    GCP_PROJECT_ID: "<ADD_PROD_PROJECT_ID_HERE>"
+    FUNCTION_SA_EMAIL: "scheduler-resumer-fn-sa@<ADD_PROD_PROJECT_ID_HERE>.iam.gserviceaccount.com"
+    SCHEDULER_SA_EMAIL: "scheduler-resumer-invoker-sa@<ADD_PROD_PROJECT_ID_HERE>.iam.gserviceaccount.com"
     # BUILD_SA_EMAIL: ""
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      changes:
-        - ignore_list.txt
-        - main.py
-        - requirements.txt
-        - deploy.sh
-        - .gitlab-ci.yml
+      when: manual
