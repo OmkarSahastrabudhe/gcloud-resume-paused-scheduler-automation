@@ -1,0 +1,28 @@
+stages:
+  - sync_schedulers
+
+variables:
+  GCP_PROJECT_ID: "project-23b4d130-a5d8-4d92-806"
+  GCP_REGION: "asia-south1"
+  FUNCTION_NAME: "resume-schedulers-fn"
+  SCHEDULER_NAME: "master-morning-resumer"
+  TARGET_CRON: "0 8 * * *"
+  TARGET_TZ: "Asia/Kolkata"
+  PYTHON_RUNTIME: "python312"
+
+sync_resumer_pipeline:
+  stage: sync_schedulers
+  image: google/cloud-sdk:slim
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq jq >/dev/null
+  script:
+    - chmod +x ./deploy.sh
+    - ./deploy.sh
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - ignore_list.txt
+        - main.py
+        - requirements.txt
+        - deploy.sh
+        - .gitlab-ci.yml
