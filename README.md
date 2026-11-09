@@ -78,27 +78,29 @@ scheduler-automation/
 [Master Cloud Scheduler: master-morning-resumer (0 8 * * * IST)]
         │
         │ 2. HTTP POST + OIDC ID Token (Header: Authorization: Bearer <JWT>)
-        │    Identity: scheduler-resumer-sa (Checked for 'Cloud Run Invoker')
+        │    Identity: SCHEDULER_SA_EMAIL (Checked for 'Cloud Run Invoker' on this service)
         ▼
 [Cloud Run Function: resume-schedulers-fn (Python 3.12+)]
         │
         ├─► Reads Env Vars: GCP_PROJECT_ID, GCP_REGION, IGNORE_SCHEDULERS
         ├─► Calls GCP Scheduler API: client.list_jobs()
-        │   Identity: scheduler-resumer-sa (Checked for 'Cloud Scheduler Admin')
+        │   Identity: FUNCTION_SA_EMAIL (Checked for 'Cloud Scheduler Admin')
         │
         ├──► Is Job PAUSED & NOT in Ignore List? ──► YES ──► client.resume_job() ──► [ENABLED]
         └──► Is Job PAUSED & IN Ignore List?     ──► YES ──► [SKIP] (Remains PAUSED)
 ```
 
-### 4.2 Zero-Default-SA Policy & Single Custom Service Account Matrix
-To avoid relying on the overly permissive Default Compute Engine Service Account (`*-compute@developer.gserviceaccount.com`), we enforce a **Single Custom Service Account (`scheduler-resumer-sa`)** across all three operational boundaries using `--build-service-account`, `--service-account`, and `--oidc-service-account-email`:
+### 4.2 Zero-Default-SA Policy & Split Service Account Matrix (Least Privilege)
+To avoid relying on the overly permissive Default Compute Engine Service Account (`*-compute@developer.gserviceaccount.com`), and to follow least privilege, **the Function and the Master Scheduler run as different custom service accounts**. `deploy.sh` refuses to run if `FUNCTION_SA_EMAIL == SCHEDULER_SA_EMAIL`.
 
 | Lifecycle Phase | Active GCP Service | Identity (Principal) | IAM Role Required | Technical Purpose |
 | :--- | :--- | :--- | :--- | :--- |
-| **1. Build Phase** | Cloud Build / Buildpacks | `scheduler-resumer-sa` | `roles/run.builder` (`Cloud Run Builder`) | Assigned via `--build-service-account`. Packages `main.py` and `requirements.txt` into a container image without using the Default Compute SA. |
-| **2. Trigger Phase** | Master Cloud Scheduler | `scheduler-resumer-sa` | `roles/run.invoker` (`Cloud Run Invoker`) | Assigned via `--oidc-service-account-email`. Mints a Google-signed **OIDC JWT Token** attached to the HTTP `Authorization: Bearer` header to pass Cloud Run's authentication gatekeeper. |
-| **3. Runtime Phase** | Cloud Run Function | `scheduler-resumer-sa` | `roles/cloudscheduler.admin` (`Cloud Scheduler Admin`) | Assigned via `--service-account`. Grants the Python container permission to execute `cloudscheduler.jobs.list` and `cloudscheduler.jobs.enable` (`resume_job`). |
-| **4. CI/CD Runner** | GCP-Hosted GitLab Runner | Runner VM/GKE SA | `roles/run.admin`, `roles/cloudscheduler.admin`, `roles/iam.serviceAccountUser` | Allows the in-GCP GitLab Runner to deploy/update Cloud Run and Cloud Scheduler via Instance Metadata without static JSON service account keys. |
+| **1. Build Phase** | Cloud Build / Buildpacks | `BUILD_SA_EMAIL` (**optional**) | `roles/run.builder` (`Cloud Run Builder`) | Only used during `--source` builds, never at runtime. If unset, `--build-service-account` is omitted and GCP uses the project's default Cloud Build SA. Set it only if the org enforces a custom build SA. |
+| **2. Trigger Phase** | Master Cloud Scheduler | `SCHEDULER_SA_EMAIL` | `roles/run.invoker` **on the `resume-schedulers-fn` service only** | Assigned via `--oidc-service-account-email`. Mints a Google-signed **OIDC JWT Token** for Cloud Run's auth gatekeeper. `deploy.sh` grants this binding idempotently via `gcloud run services add-iam-policy-binding`. This SA has **no** Cloud Scheduler permissions. |
+| **3. Runtime Phase** | Cloud Run Function | `FUNCTION_SA_EMAIL` | `roles/cloudscheduler.admin` (`Cloud Scheduler Admin`) | Assigned via `--service-account`. Grants the Python container permission to execute `cloudscheduler.jobs.list` and `cloudscheduler.jobs.enable` (`resume_job`). This SA does **not** need `run.invoker`. |
+| **4. CI/CD Runner** | GCP-Hosted GitLab Runner | Runner VM/GKE SA | `roles/run.admin`, `roles/cloudscheduler.admin`, `roles/iam.serviceAccountUser` **on all of the above SAs** | Deploys/updates Cloud Run and Cloud Scheduler and sets the IAM invoker binding, via Instance Metadata without static JSON keys. `actAs` is required on each SA that is attached. |
+
+Configure the identities in `.gitlab-ci.yml` (`FUNCTION_SA_EMAIL`, `SCHEDULER_SA_EMAIL`, optional `BUILD_SA_EMAIL`). In the console, only the runtime SA appears on the function (Security tab) and the OIDC SA on the scheduler; the build SA appears only in Cloud Build history. Drift on the function's runtime SA or the scheduler's OIDC SA is detected and reconciled on every pipeline run.
 
 ### 4.3 Why OIDC Token Instead of OAuth Token on Cloud Scheduler?
 * **OIDC Token (`Add OIDC token`):** Used when Cloud Scheduler targets an application endpoint such as a **Cloud Run Function/Service** (`*.run.app`). Cloud Run's IAM gatekeeper validates the signed OpenID Connect ID card (`aud` = Function URL, `sub` = Service Account).
@@ -234,11 +236,39 @@ PROJECT_ID="${GCP_PROJECT_ID:-$(gcloud config get-value project)}"
 REGION="${GCP_REGION:-asia-south1}"
 FUNCTION_NAME="${FUNCTION_NAME:-resume-schedulers-fn}"
 SCHEDULER_NAME="${SCHEDULER_NAME:-master-morning-resumer}"
-SA_EMAIL="${SA_EMAIL:-scheduler-resumer-sa@${PROJECT_ID}.iam.gserviceaccount.com}"
+
+# ---------------------------------------------------------
+# Least-privilege identity split (one SA per responsibility)
+#   FUNCTION_SA_EMAIL  -> Cloud Run Function runtime identity (needs Cloud Scheduler list/resume)
+#   SCHEDULER_SA_EMAIL -> Master Cloud Scheduler OIDC identity (needs ONLY run.invoker on this function)
+#   BUILD_SA_EMAIL     -> OPTIONAL Cloud Build identity for --source deploys.
+#                         Empty = flag omitted, GCP uses the project's default Cloud Build SA.
+# ---------------------------------------------------------
+FUNCTION_SA_EMAIL="${FUNCTION_SA_EMAIL:?FUNCTION_SA_EMAIL must be set (Cloud Run Function runtime SA)}"
+SCHEDULER_SA_EMAIL="${SCHEDULER_SA_EMAIL:?SCHEDULER_SA_EMAIL must be set (Master Scheduler OIDC invoker SA)}"
+BUILD_SA_EMAIL="${BUILD_SA_EMAIL:-}"
+
+BUILD_SA_FLAG=()
+if [[ -n "$BUILD_SA_EMAIL" ]]; then
+  BUILD_SA_FLAG=(--build-service-account="projects/${PROJECT_ID}/serviceAccounts/${BUILD_SA_EMAIL}")
+fi
 
 TARGET_CRON="${TARGET_CRON:-0 8 * * *}"
 TARGET_TZ="${TARGET_TZ:-Asia/Kolkata}"
 PYTHON_RUNTIME="${PYTHON_RUNTIME:-python312}"
+
+if [[ "$FUNCTION_SA_EMAIL" == "$SCHEDULER_SA_EMAIL" ]]; then
+  echo "❌ FUNCTION_SA_EMAIL and SCHEDULER_SA_EMAIL must be different service accounts." >&2
+  exit 1
+fi
+
+# 0. Pre-flight: fail fast if any SA does not exist (or runner cannot see it)
+for sa in "$FUNCTION_SA_EMAIL" "$SCHEDULER_SA_EMAIL" ${BUILD_SA_EMAIL:+"$BUILD_SA_EMAIL"}; do
+  if ! gcloud iam service-accounts describe "$sa" --project="$PROJECT_ID" >/dev/null 2>&1; then
+    echo "❌ Service account not found or not accessible: ${sa}" >&2
+    exit 1
+  fi
+done
 
 # 1. Cleanly parse ignore_list.txt (strip # comments, blank lines, CR, and spaces)
 IGNORE_LIST=$(grep -v '^[[:space:]]*#' ignore_list.txt | grep -v '^[[:space:]]*$' | tr -d ' \r' | paste -sd ',' - || true)
@@ -246,14 +276,32 @@ IGNORE_LIST=$(grep -v '^[[:space:]]*#' ignore_list.txt | grep -v '^[[:space:]]*$
 # 2. Calculate SHA256 Fingerprint of main.py + requirements.txt + PYTHON_RUNTIME
 LOCAL_CODE_HASH=$( (cat main.py requirements.txt; echo "$PYTHON_RUNTIME") | sha256sum | awk '{print $1}' )
 
+ENV_VARS="^@^GCP_PROJECT_ID=${PROJECT_ID}@GCP_REGION=${REGION}@MASTER_SCHEDULER_NAME=${SCHEDULER_NAME}@IGNORE_SCHEDULERS=${IGNORE_LIST}@CODE_HASH=${LOCAL_CODE_HASH}"
+
 echo "========================================================"
 echo "Dynamic Project ID : ${PROJECT_ID}"
 echo "Dynamic Region     : ${REGION}"
 echo "Python Runtime     : ${PYTHON_RUNTIME}"
+echo "Function SA        : ${FUNCTION_SA_EMAIL}"
+echo "Scheduler SA       : ${SCHEDULER_SA_EMAIL}"
+echo "Build SA           : ${BUILD_SA_EMAIL:-<GCP default Cloud Build SA>}"
 echo "Parsed Ignore List : [${IGNORE_LIST}]"
 echo "Target Cron Timer  : ${TARGET_CRON} (${TARGET_TZ})"
 echo "Local Code Hash    : ${LOCAL_CODE_HASH}"
 echo "========================================================"
+
+deploy_function_from_source() {
+  gcloud run deploy "$FUNCTION_NAME" \
+    --source=. \
+    --function=hello_http \
+    --base-image="$PYTHON_RUNTIME" \
+    --region="$REGION" \
+    --project="$PROJECT_ID" \
+    --service-account="$FUNCTION_SA_EMAIL" \
+    ${BUILD_SA_FLAG[@]+"${BUILD_SA_FLAG[@]}"} \
+    --no-allow-unauthenticated \
+    --set-env-vars="$ENV_VARS"
+}
 
 # ---------------------------------------------------------
 # PART A: CLOUD RUN FUNCTION CHECK & UPDATE
@@ -261,68 +309,74 @@ echo "========================================================"
 if SERVICE_JSON=$(gcloud run services describe "$FUNCTION_NAME" --region="$REGION" --project="$PROJECT_ID" --format=json 2>/dev/null); then
   DEPLOYED_HASH=$(echo "$SERVICE_JSON" | jq -r '.spec.template.spec.containers[0].env[]? | select(.name=="CODE_HASH") | .value // empty' || true)
   DEPLOYED_IGNORE=$(echo "$SERVICE_JSON" | jq -r '.spec.template.spec.containers[0].env[]? | select(.name=="IGNORE_SCHEDULERS") | .value // empty' || true)
+  DEPLOYED_SA=$(echo "$SERVICE_JSON" | jq -r '.spec.template.spec.serviceAccountName // empty' || true)
 
   echo "Deployed Code Hash : ${DEPLOYED_HASH:-<none>}"
   echo "Deployed Ignore    : [${DEPLOYED_IGNORE}]"
+  echo "Deployed Func SA   : ${DEPLOYED_SA:-<none>}"
   echo "--------------------------------------------------------"
 
   if [[ "$LOCAL_CODE_HASH" != "$DEPLOYED_HASH" ]]; then
     echo "🔨 [FUNCTION - CODE/RUNTIME CHANGED] Deploying updated source / runtime..."
-    gcloud run deploy "$FUNCTION_NAME" \
-      --source=. \
-      --function=hello_http \
-      --base-image="$PYTHON_RUNTIME" \
-      --region="$REGION" \
-      --project="$PROJECT_ID" \
-      --service-account="$SA_EMAIL" \
-      --build-service-account="projects/${PROJECT_ID}/serviceAccounts/${SA_EMAIL}" \
-      --no-allow-unauthenticated \
-      --set-env-vars="^@^GCP_PROJECT_ID=${PROJECT_ID}@GCP_REGION=${REGION}@MASTER_SCHEDULER_NAME=${SCHEDULER_NAME}@IGNORE_SCHEDULERS=${IGNORE_LIST}@CODE_HASH=${LOCAL_CODE_HASH}"
-  elif [[ "$IGNORE_LIST" != "$DEPLOYED_IGNORE" ]]; then
-    echo "⚡ [FUNCTION - FAST PATH] Code unchanged! Updating ONLY IGNORE_SCHEDULERS from [${DEPLOYED_IGNORE}] to [${IGNORE_LIST}]..."
+    deploy_function_from_source
+  elif [[ "$IGNORE_LIST" != "$DEPLOYED_IGNORE" || "$FUNCTION_SA_EMAIL" != "$DEPLOYED_SA" ]]; then
+    echo "⚡ [FUNCTION - FAST PATH] Code unchanged! Updating ignore list / runtime SA only..."
     gcloud run services update "$FUNCTION_NAME" \
       --region="$REGION" \
       --project="$PROJECT_ID" \
-      --update-env-vars="^@^GCP_PROJECT_ID=${PROJECT_ID}@GCP_REGION=${REGION}@MASTER_SCHEDULER_NAME=${SCHEDULER_NAME}@IGNORE_SCHEDULERS=${IGNORE_LIST}@CODE_HASH=${LOCAL_CODE_HASH}"
+      --service-account="$FUNCTION_SA_EMAIL" \
+      --update-env-vars="$ENV_VARS"
   else
-    echo "✅ [FUNCTION - SKIP] Both Code Hash and Ignore List are already identical. Zero changes needed!"
+    echo " [FUNCTION - SKIP] Code Hash, Ignore List and Runtime SA are already identical. Zero changes needed!"
   fi
 else
-  echo "🚀 [FUNCTION - FIRST RUN] Creating Function from scratch..."
-  gcloud run deploy "$FUNCTION_NAME" \
-    --source=. \
-    --function=hello_http \
-    --base-image="$PYTHON_RUNTIME" \
-    --region="$REGION" \
-    --project="$PROJECT_ID" \
-    --service-account="$SA_EMAIL" \
-    --build-service-account="projects/${PROJECT_ID}/serviceAccounts/${SA_EMAIL}" \
-    --no-allow-unauthenticated \
-    --set-env-vars="^@^GCP_PROJECT_ID=${PROJECT_ID}@GCP_REGION=${REGION}@MASTER_SCHEDULER_NAME=${SCHEDULER_NAME}@IGNORE_SCHEDULERS=${IGNORE_LIST}@CODE_HASH=${LOCAL_CODE_HASH}"
+  echo " [FUNCTION - FIRST RUN] Creating Function from scratch..."
+  deploy_function_from_source
 fi
 
 FUNC_URL=$(gcloud run services describe "$FUNCTION_NAME" --region="$REGION" --project="$PROJECT_ID" --format="value(status.url)")
 
 # ---------------------------------------------------------
+# PART A.2: GRANT INVOKER TO SCHEDULER SA (resource-level, idempotent)
+# Scoped to THIS service only — not a project-wide roles/run.invoker grant.
+# ---------------------------------------------------------
+echo " [IAM] Ensuring ${SCHEDULER_SA_EMAIL} has roles/run.invoker on ${FUNCTION_NAME}..."
+gcloud run services add-iam-policy-binding "$FUNCTION_NAME" \
+  --region="$REGION" \
+  --project="$PROJECT_ID" \
+  --member="serviceAccount:${SCHEDULER_SA_EMAIL}" \
+  --role="roles/run.invoker" \
+  --quiet >/dev/null
+
+# ---------------------------------------------------------
 # PART B: MASTER CLOUD SCHEDULER CHECK & UPDATE
 # ---------------------------------------------------------
-if gcloud scheduler jobs describe "$SCHEDULER_NAME" --location="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
-  CURRENT_CRON=$(gcloud scheduler jobs describe "$SCHEDULER_NAME" --location="$REGION" --project="$PROJECT_ID" --format="value(schedule)")
-  CURRENT_TZ=$(gcloud scheduler jobs describe "$SCHEDULER_NAME" --location="$REGION" --project="$PROJECT_ID" --format="value(timeZone)")
+if JOB_JSON=$(gcloud scheduler jobs describe "$SCHEDULER_NAME" --location="$REGION" --project="$PROJECT_ID" --format=json 2>/dev/null); then
+  CURRENT_CRON=$(echo "$JOB_JSON" | jq -r '.schedule // empty')
+  CURRENT_TZ=$(echo "$JOB_JSON" | jq -r '.timeZone // empty')
+  CURRENT_URI=$(echo "$JOB_JSON" | jq -r '.httpTarget.uri // empty')
+  CURRENT_OIDC_SA=$(echo "$JOB_JSON" | jq -r '.httpTarget.oidcToken.serviceAccountEmail // empty')
 
-  if [[ "$CURRENT_CRON" == "$TARGET_CRON" && "$CURRENT_TZ" == "$TARGET_TZ" ]]; then
-    echo "✅ [SCHEDULER - SKIP] Master Scheduler is already set to '${CURRENT_CRON}' (${CURRENT_TZ})."
+  echo "Scheduler Cron/TZ  : ${CURRENT_CRON} (${CURRENT_TZ})"
+  echo "Scheduler OIDC SA  : ${CURRENT_OIDC_SA:-<none>}"
+
+  if [[ "$CURRENT_CRON" == "$TARGET_CRON" && "$CURRENT_TZ" == "$TARGET_TZ" \
+        && "${CURRENT_URI%/}" == "${FUNC_URL%/}" && "$CURRENT_OIDC_SA" == "$SCHEDULER_SA_EMAIL" ]]; then
+    echo " [SCHEDULER - SKIP] Master Scheduler schedule, target and OIDC SA already match."
   else
-    echo "🔄 [SCHEDULER - UPDATE] Updating timer from '${CURRENT_CRON}' to '${TARGET_CRON}'..."
+    echo " [SCHEDULER - UPDATE] Reconciling schedule / target / OIDC SA..."
     gcloud scheduler jobs update http "$SCHEDULER_NAME" \
       --location="$REGION" \
       --project="$PROJECT_ID" \
       --schedule="$TARGET_CRON" \
       --time-zone="$TARGET_TZ" \
-      --uri="$FUNC_URL"
+      --uri="$FUNC_URL" \
+      --http-method=POST \
+      --oidc-service-account-email="$SCHEDULER_SA_EMAIL" \
+      --oidc-token-audience="$FUNC_URL"
   fi
 else
-  echo "⏰ [SCHEDULER - FIRST RUN] Creating Master Scheduler '$SCHEDULER_NAME'..."
+  echo " [SCHEDULER - FIRST RUN] Creating Master Scheduler '$SCHEDULER_NAME'..."
   gcloud scheduler jobs create http "$SCHEDULER_NAME" \
     --location="$REGION" \
     --project="$PROJECT_ID" \
@@ -330,7 +384,8 @@ else
     --time-zone="$TARGET_TZ" \
     --uri="$FUNC_URL" \
     --http-method=POST \
-    --oidc-service-account-email="$SA_EMAIL"
+    --oidc-service-account-email="$SCHEDULER_SA_EMAIL" \
+    --oidc-token-audience="$FUNC_URL"
 fi
 ```
 
@@ -347,6 +402,10 @@ variables:
   TARGET_CRON: "0 8 * * *"
   TARGET_TZ: "Asia/Kolkata"
   PYTHON_RUNTIME: "python312"
+  # Separate identities (least privilege). Replace with the IDfy-provisioned SA emails.
+  FUNCTION_SA_EMAIL: "scheduler-resumer-fn-sa@project-23b4d130-a5d8-4d92-806.iam.gserviceaccount.com"
+  SCHEDULER_SA_EMAIL: "scheduler-resumer-invoker-sa@project-23b4d130-a5d8-4d92-806.iam.gserviceaccount.com"
+  # BUILD_SA_EMAIL: ""   # optional; leave unset to use GCP's default Cloud Build SA
 
 sync_resumer_pipeline:
   stage: sync_schedulers

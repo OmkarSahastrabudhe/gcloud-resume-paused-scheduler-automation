@@ -1,8 +1,9 @@
 stages:
+  - validate
   - sync_schedulers
 
+# Common (non-secret) settings shared by every environment
 variables:
-  GCP_PROJECT_ID: "project-23b4d130-a5d8-4d92-806"
   GCP_REGION: "asia-south1"
   FUNCTION_NAME: "resume-schedulers-fn"
   SCHEDULER_NAME: "master-morning-resumer"
@@ -10,14 +11,63 @@ variables:
   TARGET_TZ: "Asia/Kolkata"
   PYTHON_RUNTIME: "python312"
 
-sync_resumer_pipeline:
+# ---------------------------------------------------------
+# Stage 1: cheap static checks (no GCP access needed)
+# ---------------------------------------------------------
+validate:
+  stage: validate
+  image: google/cloud-sdk:slim
+  script:
+    - bash -n deploy.sh
+    - test -f ignore_list.txt || (echo "ignore_list.txt missing - every PAUSED job would be resumed" && exit 1)
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# ---------------------------------------------------------
+# Shared deploy template
+# ---------------------------------------------------------
+.deploy_template:
   stage: sync_schedulers
   image: google/cloud-sdk:slim
+  # tags: [ "<idfy-gcp-runner-tag>" ]   # uncomment if the GCP runner needs a tag
   before_script:
     - apt-get update -qq && apt-get install -y -qq jq >/dev/null
+    - echo "CI identity -> $(gcloud config get-value account 2>/dev/null)"
+    - echo "Target project -> ${GCP_PROJECT_ID}"
   script:
     - chmod +x ./deploy.sh
     - ./deploy.sh
+
+# ---------------------------------------------------------
+# TEST: any non-default branch, IDfy test project, manual click
+# ---------------------------------------------------------
+deploy_test:
+  extends: .deploy_template
+  environment:
+    name: test
+  resource_group: schedulers-test
+  variables:
+    GCP_PROJECT_ID: "<IDFY_TEST_PROJECT_ID>"
+    FUNCTION_SA_EMAIL: "scheduler-resumer-fn-sa@<IDFY_TEST_PROJECT_ID>.iam.gserviceaccount.com"
+    SCHEDULER_SA_EMAIL: "scheduler-resumer-invoker-sa@<IDFY_TEST_PROJECT_ID>.iam.gserviceaccount.com"
+    # BUILD_SA_EMAIL: ""   # optional; leave unset to use GCP's default Cloud Build SA
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: manual
+
+# ---------------------------------------------------------
+# PROD: default branch only, automatic on relevant changes
+# ---------------------------------------------------------
+deploy_prod:
+  extends: .deploy_template
+  environment:
+    name: production
+  resource_group: schedulers-production
+  variables:
+    GCP_PROJECT_ID: "project-23b4d130-a5d8-4d92-806"
+    FUNCTION_SA_EMAIL: "scheduler-resumer-fn-sa@project-23b4d130-a5d8-4d92-806.iam.gserviceaccount.com"
+    SCHEDULER_SA_EMAIL: "scheduler-resumer-invoker-sa@project-23b4d130-a5d8-4d92-806.iam.gserviceaccount.com"
+    # BUILD_SA_EMAIL: ""
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       changes:
