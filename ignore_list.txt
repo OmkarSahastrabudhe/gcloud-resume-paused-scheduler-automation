@@ -1,1 +1,2 @@
-#. add scheduler that are needed to be neglected
+# Schedulers listed below (one per line) will remain PAUSED during the morning auto-resume run.
+# Blank lines and lines starting with '#' are automatically ignored.
