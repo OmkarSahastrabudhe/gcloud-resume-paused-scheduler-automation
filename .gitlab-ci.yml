@@ -12,7 +12,7 @@ variables:
   PYTHON_RUNTIME: "python312"
 
 # ---------------------------------------------------------
-# Stage 1: cheap static checks (no GCP access needed)
+# Stage 1:  static checks (no GCP access needed)
 # ---------------------------------------------------------
 validate:
   stage: validate
